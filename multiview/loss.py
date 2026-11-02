@@ -6,24 +6,18 @@ import torch.nn.functional as F
 
 class TinyAlignmentLoss(nn.Module):
     """
-    Multi-view CNNGeometric için tiny object alignment loss.
+    CNNGeometric multi-view tiny-object alignment loss.
 
-    Beklenen girişler:
-        theta:         (B, V, 2, 3)
-        center_boxes:  (B, N, 4)
-        view_boxes:    (B, V, N, 4)
-        view_mask:     (B, V)
-        instance_mask: (B, N)
+    theta:         (B, V, 2, 3)
+    center_boxes:  (B, N, 4)
+    view_boxes:    (B, V, N, 4)
+    view_mask:     (B, V)
+    instance_mask: (B, N)
 
-    Bounding box formatı: xyxy, piksel koordinatları.
+    theta maps normalized CENTER coordinates
+    to normalized SIDE coordinates.
 
-    theta:
-        affine_grid ile uyumlu, output -> input
-        yönündeki normalize affine dönüşüm.
-
-    Not:
-        Bu sınıf theta'nın center(output) -> side(input)
-        yönünde olduğunu varsayar.
+    Bounding boxes use pixel-space xyxy.
     """
 
     def __init__(
@@ -32,81 +26,54 @@ class TinyAlignmentLoss(nn.Module):
         center_weight=1.0,
         box_weight=0.25,
         reg_weight=0.01,
-        reg_type="identity",
+        beta=0.02,
     ):
         super().__init__()
 
-        self.image_size = image_size
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+
+        self.height, self.width = image_size
+
         self.center_weight = center_weight
         self.box_weight = box_weight
         self.reg_weight = reg_weight
-        self.reg_type = reg_type
+        self.beta = beta
 
     @staticmethod
     def box_centers(boxes):
-        return (boxes[..., :2] + boxes[..., 2:]) / 2
+        return (
+            boxes[..., :2] + boxes[..., 2:]
+        ) / 2.0
 
     @staticmethod
     def box_corners(boxes):
-        x1, y1, x2, y2 = boxes.unbind(dim=-1)
+        x1, y1, x2, y2 = boxes.unbind(-1)
 
-        return torch.stack(
-            [
-                torch.stack([x1, y1], dim=-1),
-                torch.stack([x2, y1], dim=-1),
-                torch.stack([x2, y2], dim=-1),
-                torch.stack([x1, y2], dim=-1),
-            ],
-            dim=-2,
-        )
+        return torch.stack([
+            torch.stack([x1, y1], dim=-1),
+            torch.stack([x2, y1], dim=-1),
+            torch.stack([x2, y2], dim=-1),
+            torch.stack([x1, y2], dim=-1),
+        ], dim=-2)
 
     def pixel_to_normalized(self, points):
-        """
-        align_corners=False için:
-        x_norm = 2 * (x + 0.5) / W - 1
-        """
-        return 2.0 * (points + 0.5) / self.image_size - 1.0
+        scale = points.new_tensor([
+            self.width,
+            self.height,
+        ])
 
-    def normalized_to_pixel(self, points):
-        return (
-            (points + 1.0) * self.image_size / 2.0
-        ) - 0.5
+        return 2.0 * (points + 0.5) / scale - 1.0
 
     @staticmethod
-    def invert_affine(theta):
-        """
-        (B,V,2,3) -> (B,V,3,3) inverse.
-
-        torch.linalg.inv kullanmak yerine
-        solve üzerinden hesaplanır.
-        """
-        B, V = theta.shape[:2]
-
-        bottom = theta.new_zeros((B, V, 1, 3))
-        bottom[..., 0, 2] = 1.0
-
-        matrix = torch.cat([theta, bottom], dim=-2)
-
-        identity = torch.eye(
-            3,
-            device=theta.device,
-            dtype=theta.dtype,
-        ).expand(B, V, 3, 3)
-
-        inverse = torch.linalg.solve(matrix, identity)
-
-        return inverse[..., :2, :]
-
-    @staticmethod
-    def transform_points(points, affine):
+    def transform_points(points, theta):
         """
         points: (B,V,N,K,2)
-        affine: (B,V,2,3)
-
-        returns: (B,V,N,K,2)
+        theta:  (B,V,2,3)
         """
-        linear = affine[..., :2]
-        translation = affine[..., 2]
+
+        linear = theta[..., :2]
+        translation = theta[..., 2]
 
         transformed = torch.einsum(
             "bvij,bvnkj->bvnki",
@@ -114,7 +81,10 @@ class TinyAlignmentLoss(nn.Module):
             points,
         )
 
-        return transformed + translation[:, :, None, None, :]
+        return (
+            transformed
+            + translation[:, :, None, None, :]
+        )
 
     @staticmethod
     def masked_mean(values, mask):
@@ -140,101 +110,101 @@ class TinyAlignmentLoss(nn.Module):
             & instance_mask[:, None, :]
         )
 
-        # Center / side box merkezleri
-        center_centers = self.box_centers(
-            center_boxes
-        )
+        # ----------------------------------
+        # 1. Center alignment
+        # ----------------------------------
 
-        view_centers = self.box_centers(
-            view_boxes
-        )
-
-        # Pixel -> normalized
         center_points = self.pixel_to_normalized(
-            center_centers
+            self.box_centers(center_boxes)
         )
 
         side_points = self.pixel_to_normalized(
-            view_centers
+            self.box_centers(view_boxes)
         )
 
-        # (B,V,N,1,2)
-        side_points = side_points.unsqueeze(-2)
+        # Center -> Side
+        center_points = (
+            center_points[:, None]
+            .expand(-1, V, -1, -1)
+            .unsqueeze(-2)
+        )
 
-        # theta center -> side ise
-        # inverse side -> center dönüşümüdür.
-        theta_inv = self.invert_affine(theta)
+        predicted_side_points = (
+            self.transform_points(
+                center_points,
+                theta,
+            ).squeeze(-2)
+        )
 
-        transformed_centers = self.transform_points(
+        center_error = F.smooth_l1_loss(
+            predicted_side_points,
             side_points,
-            theta_inv,
-        ).squeeze(-2)
-
-        # Normalized center error
-        center_error = (
-            transformed_centers
-            - center_points[:, None]
-        ).abs().mean(dim=-1)
+            reduction="none",
+            beta=self.beta,
+        ).mean(dim=-1)
 
         center_loss = self.masked_mean(
             center_error,
             valid,
         )
 
-        # ---------------------------------------
-        # Bounding box corner alignment
-        # ---------------------------------------
-
-        center_corners = self.box_corners(
-            center_boxes
-        )
-
-        side_corners = self.box_corners(
-            view_boxes
-        )
+        # ----------------------------------
+        # 2. Bounding box alignment
+        # ----------------------------------
 
         center_corners = self.pixel_to_normalized(
-            center_corners
+            self.box_corners(center_boxes)
         )
 
         side_corners = self.pixel_to_normalized(
-            side_corners
+            self.box_corners(view_boxes)
         )
 
-        transformed_corners = self.transform_points(
+        center_corners = (
+            center_corners[:, None]
+            .expand(-1, V, -1, -1, -1)
+        )
+
+        predicted_side_corners = (
+            self.transform_points(
+                center_corners,
+                theta,
+            )
+        )
+
+        box_error = F.smooth_l1_loss(
+            predicted_side_corners,
             side_corners,
-            theta_inv,
-        )
-
-        corner_error = (
-            transformed_corners
-            - center_corners[:, None]
-        ).abs().mean(dim=(-1, -2))
+            reduction="none",
+            beta=self.beta,
+        ).mean(dim=(-1, -2))
 
         box_loss = self.masked_mean(
-            corner_error,
+            box_error,
             valid,
         )
 
-        # ---------------------------------------
-        # Affine regularization
-        # ---------------------------------------
+        # ----------------------------------
+        # 3. Affine regularization
+        # ----------------------------------
 
-        identity = torch.tensor(
-            [[1.0, 0.0, 0.0],
-             [0.0, 1.0, 0.0]],
-            device=theta.device,
-            dtype=theta.dtype,
-        )
+        identity = theta.new_tensor([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ])
 
         reg_error = (
             theta - identity
-        ).pow(2).mean(dim=(-1, -2))
+        ).square().mean(dim=(-1, -2))
 
         reg_loss = self.masked_mean(
             reg_error,
             view_mask,
         )
+
+        # ----------------------------------
+        # 4. Total loss
+        # ----------------------------------
 
         total = (
             self.center_weight * center_loss
