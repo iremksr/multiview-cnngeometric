@@ -1,4 +1,4 @@
-"""Train CNNGeometric on partially observed MessyTable scenes.
+"""Train Experiment G on partially observed MessyTable scenes.
 Run from repository root: python -m multiview.train ...
 """
 import argparse
@@ -42,7 +42,12 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
     pairs_total = views_total = hits_total = 0
     for batch in tqdm(loader, desc='train' if training else 'val', leave=False):
         keys = ('views', 'center', 'center_boxes', 'view_boxes',
-                'view_mask', 'instance_mask', 'pair_mask')
+                'view_mask', 'instance_mask', 'pair_mask',
+                'center_roi_boxes', 'view_roi_boxes',
+                'center_roi_mask', 'view_roi_mask')
+        missing = [k for k in keys if k not in batch]
+        if missing:
+            raise KeyError(f'Experiment G dataset/collate missing keys: {missing}')
         x = {k: batch[k].to(device, non_blocking=True) for k in keys}
         valid = (x['view_mask'][:, :, None] & x['instance_mask'][:, None, :]
                  & x['pair_mask'])
@@ -53,8 +58,14 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
-            result = model(x['views'], x['center'], return_warped=False,
-                           view_mask=x['view_mask'])
+            result = model(
+                x['views'], x['center'], return_warped=False,
+                view_mask=x['view_mask'],
+                center_roi_boxes=x['center_roi_boxes'],
+                view_roi_boxes=x['view_roi_boxes'],
+                center_roi_mask=x['center_roi_mask'],
+                view_roi_mask=x['view_roi_mask'],
+            )
             losses = criterion(theta=result['theta'], center_boxes=x['center_boxes'],
                                view_boxes=x['view_boxes'], view_mask=x['view_mask'],
                                instance_mask=x['instance_mask'], pair_mask=x['pair_mask'])
@@ -62,8 +73,6 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
                 raise RuntimeError('Non-finite loss: check annotations and theta')
             if training:
                 losses['loss'].backward()
-                if training and model.fusion.mlp[-1].weight.grad is not None:
-                    grad_norm = model.fusion.mlp[-1].weight.grad.norm().item()
                 torch.nn.utils.clip_grad_norm_(
                     (p for p in model.parameters() if p.requires_grad),
                     max_norm=1., error_if_nonfinite=True)
@@ -108,14 +117,24 @@ def load_finetuned(model, path):
     weights = checkpoint.get('model_state_dict', checkpoint)
     if not isinstance(weights, dict):
         raise ValueError(f'No model weights found in {path}')
-    model.load_state_dict(weights, strict=True)
+    # Experiment C weights initialize shared modules; G-only ROI head stays new.
+    incompatible = model.load_state_dict(weights, strict=False)
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    if unexpected or any(not k.startswith('roi_refinement.') for k in missing):
+        raise RuntimeError(
+            f'Incompatible init checkpoint: missing={sorted(missing)}, '
+            f'unexpected={sorted(unexpected)}'
+        )
+    if missing:
+        print(f'Initialized shared weights; {len(missing)} ROI parameters newly initialized', flush=True)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--data-root', required=True)
     p.add_argument('--pretrained', required=True, help='Original CNNGeometric StreetView .pth.tar')
-    p.add_argument('--init-weights', default=None, help='Previous fine-tuned checkpoint')
+    p.add_argument('--init-weights', default=None, help='Experiment C or G fine-tuned checkpoint (weights only)')
     p.add_argument('--resume', default=None, help='Resume experiment including optimizer')
     p.add_argument('--output', required=True)
     p.add_argument('--epochs', type=int, default=100)
@@ -164,6 +183,8 @@ def main():
     start, best, bad_epochs = 1, float('inf'), 0
     if args.resume:
         saved = torch.load(args.resume, map_location='cpu', weights_only=False)
+        if saved.get('experiment') != 'G':
+            raise ValueError('--resume requires an Experiment G checkpoint')
         previous_weight = saved.get('giou_weight')
         if previous_weight is None or abs(float(previous_weight) - args.giou_weight) > 1e-12:
             raise ValueError('Resume checkpoint GIoU weight missing or different; use matching --giou-weight')
@@ -204,7 +225,7 @@ def main():
                 train_m['after_iou'], val_m['after_iou'],
                 train_m['iou50'], val_m['iou50'],
                 train_m['pairs'], val_m['pairs']])
-        state = {'epoch': epoch, 'model_state_dict': model.state_dict(),
+        state = {'experiment': 'G', 'epoch': epoch, 'model_state_dict': model.state_dict(),
                  'optimizer_state_dict': optimizer.state_dict(), 'best_val': best,
                  'patience_counter': bad_epochs, 'giou_weight': args.giou_weight}
         atomic_save(out / 'last.pth', state)
