@@ -37,7 +37,7 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
     training = optimizer is not None
     model.train(training)
     # Center/box are per-pair means, regularization is a per-supervised-view mean.
-    sums = {'center_loss': 0., 'box_loss': 0., 'reg_loss': 0.,
+    sums = {'center_loss': 0., 'box_loss': 0., 'giou_loss': 0., 'reg_loss': 0.,
             'before_iou': 0., 'after_iou': 0.}
     pairs_total = views_total = hits_total = 0
     for batch in tqdm(loader, desc='train' if training else 'val', leave=False):
@@ -71,6 +71,7 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
             x['view_mask'], x['instance_mask'], x['pair_mask'])
         sums['center_loss'] += losses['center_loss'].item() * pairs
         sums['box_loss'] += losses['box_loss'].item() * pairs
+        sums['giou_loss'] += losses['giou_loss'].item() * pairs
         sums['reg_loss'] += losses['reg_loss'].item() * supervised_views
         sums['before_iou'] += before
         sums['after_iou'] += after
@@ -81,6 +82,7 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
         raise RuntimeError('No valid center-side-instance pairs in epoch')
     metrics = {'center_loss': sums['center_loss'] / pairs_total,
                'box_loss': sums['box_loss'] / pairs_total,
+               'giou_loss': sums['giou_loss'] / pairs_total,
                'reg_loss': sums['reg_loss'] / max(views_total, 1),
                'before_iou': sums['before_iou'] / pairs_total,
                'after_iou': sums['after_iou'] / pairs_total,
@@ -88,6 +90,7 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
                'pairs': pairs_total}
     metrics['loss'] = (criterion.center_weight * metrics['center_loss']
                        + criterion.box_weight * metrics['box_loss']
+                        + criterion.giou_weight * metrics['giou_loss']
                        + criterion.reg_weight * metrics['reg_loss'])
     return metrics
 
@@ -116,6 +119,8 @@ def main():
     p.add_argument('--epochs', type=int, default=100)
     p.add_argument('--batch-size', type=int, default=1)
     p.add_argument('--lr', type=float, default=5e-5)
+    p.add_argument('--giou-weight', type=float, default=0.0,
+                   help='0.0=baseline; 0.25=GIoU experiment')
     p.add_argument('--patience', type=int, default=15)
     p.add_argument('--num-workers', type=int, default=0)
     p.add_argument('--seed', type=int, default=42)
@@ -124,6 +129,8 @@ def main():
     p.add_argument('--max-val-scenes', type=int, default=0,
                    help='Limit scenes for a smoke test; 0 means all')
     args = p.parse_args()
+    if args.giou_weight < 0:
+        p.error('--giou-weight must be nonnegative')
     if args.resume and args.init_weights:
         p.error('--resume and --init-weights cannot be combined')
     seed_everything(args.seed)
@@ -148,12 +155,16 @@ def main():
     if args.init_weights:
         load_finetuned(model, args.init_weights)
         print('Initialized from:', args.init_weights, flush=True)
-    criterion = TinyAlignmentLoss(image_size=512).to(device)
+    criterion = TinyAlignmentLoss(image_size=512, giou_weight=args.giou_weight).to(device)
+    print(f'GIoU weight: {args.giou_weight}', flush=True)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=1e-4)
     start, best, bad_epochs = 1, float('inf'), 0
     if args.resume:
         saved = torch.load(args.resume, map_location='cpu', weights_only=False)
+        previous_weight = saved.get('giou_weight')
+        if previous_weight is None or abs(float(previous_weight) - args.giou_weight) > 1e-12:
+            raise ValueError('Resume checkpoint GIoU weight missing or different; use matching --giou-weight')
         model.load_state_dict(saved['model_state_dict'], strict=True)
         optimizer.load_state_dict(saved['optimizer_state_dict'])
         start, best = saved['epoch'] + 1, saved['best_val']
@@ -161,7 +172,7 @@ def main():
         print('Resuming at epoch', start, flush=True)
     history = out / 'history.csv'
     columns = ['epoch', 'train_loss', 'val_loss', 'train_center', 'val_center',
-               'train_box', 'val_box', 'train_reg', 'val_reg',
+               'train_box', 'val_box', 'train_giou', 'val_giou', 'train_reg', 'val_reg',
                'train_before_iou', 'val_before_iou', 'train_after_iou',
                'val_after_iou', 'train_iou50', 'val_iou50', 'train_pairs', 'val_pairs']
     if not args.resume or not history.exists():
@@ -185,6 +196,7 @@ def main():
                 epoch, train_m['loss'], val_m['loss'],
                 train_m['center_loss'], val_m['center_loss'],
                 train_m['box_loss'], val_m['box_loss'],
+                train_m['giou_loss'], val_m['giou_loss'],
                 train_m['reg_loss'], val_m['reg_loss'],
                 train_m['before_iou'], val_m['before_iou'],
                 train_m['after_iou'], val_m['after_iou'],
@@ -192,7 +204,7 @@ def main():
                 train_m['pairs'], val_m['pairs']])
         state = {'epoch': epoch, 'model_state_dict': model.state_dict(),
                  'optimizer_state_dict': optimizer.state_dict(), 'best_val': best,
-                 'patience_counter': bad_epochs}
+                 'patience_counter': bad_epochs, 'giou_weight': args.giou_weight}
         atomic_save(out / 'last.pth', state)
         if improved:
             atomic_save(out / 'best.pth', state)
@@ -201,7 +213,8 @@ def main():
         print(f'Epoch {epoch}/{args.epochs} | train={train_m["loss"]:.6f} '
               f'val={val_m["loss"]:.6f} best={best:.6f} '
               f'val IoU {val_m["before_iou"]:.3f}->{val_m["after_iou"]:.3f} '
-              f'IoU@.5={val_m["iou50"]:.3f} bad={bad_epochs}{gpu_mem}', flush=True)
+              f'IoU@.5={val_m["iou50"]:.3f} '
+              f'val GIoU loss={val_m["giou_loss"]:.4f} bad={bad_epochs}{gpu_mem}', flush=True)
         if bad_epochs >= args.patience:
             print('Early stopping', flush=True)
             break

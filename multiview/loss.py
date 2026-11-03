@@ -2,19 +2,24 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from multiview.losses.giou_loss import masked_giou_loss
 
 
 class TinyAlignmentLoss(nn.Module):
+    
     def __init__(self, image_size=512, center_weight=1., box_weight=.25,
-                 reg_weight=.01, beta=.02):
+                giou_weight=.25, reg_weight=.01, beta=.02):
         super().__init__()
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
+
         self.height, self.width = image_size
         self.center_weight = center_weight
         self.box_weight = box_weight
+        self.giou_weight = giou_weight
         self.reg_weight = reg_weight
         self.beta = beta
+
 
     def normalize(self, pts):
         size = pts.new_tensor([self.width, self.height])
@@ -65,14 +70,40 @@ class TinyAlignmentLoss(nn.Module):
                                    reduction='none', beta=self.beta).mean(-1)
         box_loss = self.masked_mean(box_err, valid)
 
-        identity = theta.new_tensor([[1., 0., 0.], [0., 1., 0.]])
+        
+        # GIoU: transformed center boxes vs side-view GT boxes
+        giou_loss = masked_giou_loss(
+            pred_boxes=pred_box,
+            target_boxes=target_box,
+            valid_mask=valid
+        )
+
+        # Regularization: keep affine close to identity
+        identity = theta.new_tensor([
+            [1., 0., 0.],
+            [0., 1., 0.]
+        ])
+
         reg_err = (theta - identity).square().mean((-1, -2))
         supervised_views = view_mask & valid.any(-1)
         reg_loss = self.masked_mean(reg_err, supervised_views)
-        total = (self.center_weight * center_loss + self.box_weight * box_loss
-                 + self.reg_weight * reg_loss)
-        return {'loss': total, 'center_loss': center_loss,
-                'box_loss': box_loss, 'reg_loss': reg_loss}
+
+        # Total loss
+        total = (
+            self.center_weight * center_loss
+            + self.box_weight * box_loss
+            + self.giou_weight * giou_loss
+            + self.reg_weight * reg_loss
+        )
+
+        return {
+            'loss': total,
+            'center_loss': center_loss,
+            'box_loss': box_loss,
+            'giou_loss': giou_loss,
+            'reg_loss': reg_loss
+        }
+
 
     @torch.no_grad()
     def alignment_metrics(self, theta, center_boxes, view_boxes, view_mask,
