@@ -62,6 +62,8 @@ def epoch_pass(model, loader, criterion, device, optimizer=None):
                 raise RuntimeError('Non-finite loss: check annotations and theta')
             if training:
                 losses['loss'].backward()
+                if training and model.fusion.mlp[-1].weight.grad is not None:
+                    grad_norm = model.fusion.mlp[-1].weight.grad.norm().item()
                 torch.nn.utils.clip_grad_norm_(
                     (p for p in model.parameters() if p.requires_grad),
                     max_norm=1., error_if_nonfinite=True)
