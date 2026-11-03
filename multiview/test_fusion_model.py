@@ -72,31 +72,35 @@ def test_pretrained_equivalence():
             2, 3, 2, 3
         ).clone()
 
-        for batch_idx in range(2):
-            for view_idx in range(3):
-                if not view_mask[batch_idx, view_idx]:
-                    continue
+        # Baseline: same valid pairs, same batch size
 
-                source = views[
-                    batch_idx, view_idx
-                ].unsqueeze(0)
+        b, v, c, h, w = views.shape
+        flat_valid = view_mask.reshape(-1)
 
-                target = center[
-                    batch_idx
-                ].unsqueeze(0)
+        sources = views.reshape(b * v, c, h, w)[flat_valid]
 
-                theta = model.registration({
-                    "source_image": source,
-                    "target_image": target,
-                })
+        targets = (
+            center[:, None]
+            .expand(b, v, c, h, w)
+            .reshape(b * v, c, h, w)[flat_valid]
+        )
 
-                theta_baseline[
-                    batch_idx, view_idx
-                ] = theta.reshape(2, 3)
+        theta_valid = model.registration({
+            "source_image": sources,
+            "target_image": targets,
+        }).reshape(-1, 2, 3)
 
-    difference = (
-        theta_fusion - theta_baseline
-    ).abs().max().item()
+        theta_baseline = torch.eye(
+            2, 3, device=device
+        ).reshape(1, 1, 2, 3).expand(
+            b, v, 2, 3
+        ).clone()
+
+        theta_baseline.reshape(b * v, 2, 3)[flat_valid] = theta_valid
+        
+        difference = (
+                theta_fusion - theta_baseline
+            ).abs().max().item()
 
     print(f"Maximum theta difference: {difference:.8f}")
 
