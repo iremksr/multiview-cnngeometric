@@ -1,5 +1,5 @@
 import torch
-from roi_context import ExperimentGHead
+from multiview.roi_context import ExperimentGHead
 
 def test_shapes_identity_gradient():
     torch.manual_seed(0)
